@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import ipaddress
 import sys
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -21,9 +23,9 @@ from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.screen import ModalScreen
-from textual.widgets import (Button, DataTable, Footer, Header, Input, Label, OptionList,
-                             RichLog, Static)
+from textual.screen import ModalScreen, Screen
+from textual.widgets import (Button, ContentSwitcher, DataTable, Footer, Header, Input, Label,
+                             LoadingIndicator, OptionList, RichLog, Static)
 from textual.widgets.option_list import Option
 
 import samsung_wam_wifi as wam
@@ -31,6 +33,13 @@ import samsung_wam_wifi as wam
 CMD_GET_VOLUME = "<name>GetVolume</name>"
 CMD_SET_VOLUME = '<name>SetVolume</name><p type="dec" name="volume" val="{volume}"/>'
 MAX_VOLUME = 30  # raw speaker steps
+
+
+def tx(value: str) -> str:
+    """Escape text for Textual markup (Static.update), which reads any [word], e.g. the
+    "[Samsung]" in default speaker names, as a tag. rich.markup.escape only suits the
+    RichLog, which uses Rich markup."""
+    return str(value).replace("[", r"\[")
 
 
 @dataclass
@@ -179,6 +188,351 @@ class GroupScreen(Dialog):
 
 
 # --------------------------------------------------------------------------
+# Wi-Fi setup
+# --------------------------------------------------------------------------
+
+WIFI_STEPS = ["Put the speaker in setup mode", "Find its setup Wi-Fi", "Connect this PC to it",
+              "Choose your home Wi-Fi", "Send the Wi-Fi details", "Find it on your network"]
+
+
+class WifiSetupScreen(Screen):
+    """Connects a speaker to Wi-Fi: the same steps as the text wizard (easy_mode).
+
+    Network work runs in threads, one at a time (self.net_lock). Cancelling sets
+    self.cancelled, waits for the running step to notice, then puts this PC's Wi-Fi
+    back if it was switched to the speaker. Dismisses with the speaker's new IP,
+    or None.
+    """
+    SUB_TITLE = "Wi-Fi setup"
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    TICK = 3.0             # seconds between hotspot / speaker checks
+    HOTSPOT_TIMEOUT = 90.0
+    SPEAKER_TIMEOUT = 45.0
+    HOME_POLL = 10.0       # seconds between searches for the speaker on the home network
+    HOME_TIMEOUT = 180.0
+
+    def __init__(self, port: int) -> None:
+        super().__init__()
+        self.port = port
+        self.cancelled = threading.Event()
+        self.net_lock = threading.Lock()
+        self.closing = False
+        self.step = 0
+        self.failed = False
+        self.iface = self.previous = ""
+        self.connected = False  # this PC's Wi-Fi is on the speaker's hotspot
+        self.ip = self.spk_name = None
+        self.mac = ""
+        self.candidates: list[dict[str, str]] = []
+        self.homes: list[dict[str, str]] = []
+        self.result: str | None = None
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Horizontal(id="wifi"):
+            yield Static(id="steps")
+            with Vertical(id="wifi-body"):
+                yield Static(id="wifi-text")
+                with ContentSwitcher(id="pane", initial="intro"):
+                    with Vertical(id="intro"):
+                        with Horizontal(classes="buttons"):
+                            yield Button("Start", variant="primary", id="start")
+                            yield Button("Cancel", classes="cancel")
+                    with Vertical(id="busy"):
+                        yield LoadingIndicator()
+                        yield Static(id="busy-status")
+                        with Horizontal(classes="buttons"):
+                            yield Button("Cancel", classes="cancel")
+                    with Vertical(id="pick-hotspot"):
+                        yield OptionList(id="hotspots")
+                        with Horizontal(classes="buttons"):
+                            yield Button("Use this one", variant="primary", id="use-hotspot")
+                            yield Button("Search again", id="retry")
+                            yield Button("Cancel", classes="cancel")
+                    with Vertical(id="home"):
+                        yield OptionList(id="homes")
+                        yield Label("Network name:")
+                        yield Input(id="ssid", placeholder="pick above or type it (case-sensitive)")
+                        yield Label("Wi-Fi password (leave empty if none):")
+                        yield Input(id="password", password=True)
+                        with Horizontal(classes="buttons"):
+                            yield Button("Send to speaker", variant="primary", id="send")
+                            yield Button("Cancel", classes="cancel")
+                    with Vertical(id="done"):
+                        with Horizontal(classes="buttons"):
+                            yield Button("Back to speakers", variant="primary", classes="cancel")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.goto(0, "intro",
+                  "This connects a speaker to your Wi-Fi without the Samsung app. It briefly "
+                  "switches this PC's Wi-Fi to the speaker; a wired connection stays up.\n\n"
+                  "Plug in the speaker and switch it on. Then hold the [b]WPS/Wi-Fi SETUP[/b] "
+                  "button on its back for about 5 seconds, until its light changes.\n\n"
+                  "Press [b]Start[/b] when you've done that.")
+
+    # ---- UI helpers (UI thread) ----------------------------------------
+
+    def goto(self, step: int, pane: str, text: str, failed: bool = False) -> None:
+        self.step, self.failed = step, failed
+        lines = []
+        for n, title in enumerate(WIFI_STEPS):
+            if n < step:
+                mark = "[green]✓[/green]"
+            elif n == step and failed:
+                mark = "[red]✗[/red]"
+            elif n == step:
+                mark = "[b]▶[/b]"
+            else:
+                mark = "[dim]·[/dim]"
+            lines.append(f"{mark} {n + 1}. {title}" if n != step else f"{mark} [b]{n + 1}. {title}[/b]")
+        self.query_one("#steps", Static).update("\n".join(lines))
+        self.query_one("#wifi-text", Static).update(text)
+        self.query_one("#busy-status", Static).update("")
+        self.query_one(ContentSwitcher).current = pane
+        target = {"intro": "#start", "busy": "#busy .cancel", "pick-hotspot": "#hotspots",
+                  "home": "#homes" if self.homes else "#ssid", "done": "#done .cancel"}[pane]
+        self.query_one(target).focus()
+
+    def set_status(self, text: str) -> None:
+        self.query_one("#busy-status", Static).update(text)
+
+    def ticker(self, label: str):
+        """tick() for wam's wait helpers: shows elapsed time, stops early on cancel."""
+        start = time.monotonic()
+
+        def tick() -> bool:
+            self.app.call_from_thread(self.set_status, f"{label} {time.monotonic() - start:.0f} s")
+            return not self.cancelled.wait(self.TICK)
+        return tick
+
+    def ui(self, method, *args, **kwargs) -> None:
+        """Run a UI method from a worker thread, unless the user is cancelling."""
+        if not self.cancelled.is_set():
+            self.app.call_from_thread(method, *args, **kwargs)
+
+    def finish(self) -> None:
+        self.dismiss(self.result)
+
+    # ---- worker helpers (worker threads) --------------------------------
+
+    def disconnect(self) -> None:
+        if self.connected:
+            wam.disconnect_hotspot(self.iface, self.previous)
+            self.connected = False
+            self.app.wifi_cleanup = None
+
+    def fail(self, step: int, text: str) -> None:
+        self.disconnect()
+        self.ui(self.goto, step, "done", text, failed=True)
+
+    # ---- steps -----------------------------------------------------------
+
+    @on(Button.Pressed, "#start")
+    @on(Button.Pressed, "#retry")
+    def start_search(self) -> None:
+        self.goto(1, "busy", "Looking for the speaker's setup Wi-Fi (up to 90 seconds)...")
+        self.find_worker()
+
+    @work(thread=True, group="wifi")
+    def find_worker(self) -> None:
+        with self.net_lock:
+            if self.cancelled.is_set():
+                return
+            if not self.iface:
+                self.iface = wam.wifi_interface() if wam.IS_WINDOWS else ""
+            if not self.iface:
+                self.fail(1, "I can't switch Wi-Fi networks automatically here "
+                          + ("(no Wi-Fi adapter found)." if wam.IS_WINDOWS else "(only on Windows).")
+                          + "\n\nDo it by hand instead:\n"
+                          "  1. Connect a phone or laptop to the Wi-Fi called \"\\[Samsung] ...\" "
+                          f"(password {wam.HOTSPOT_PASSWORD}).\n"
+                          "  2. From that device run:\n"
+                          "     python samsung_wam_wifi.py join <its-gateway-ip> --ssid \"YourWiFi\"")
+                return
+            hits = wam.wait_for_hotspot(self.iface, self.HOTSPOT_TIMEOUT,
+                                         self.ticker("Searching..."))
+            if self.cancelled.is_set():
+                return
+            if len(hits) == 1:
+                self.connect(hits[0])
+                return
+            if hits:
+                self.candidates = hits
+                text = "Found several speakers in setup mode. Which one?"
+            else:
+                blocked = wam.location_blocked(self.iface)
+                if blocked:
+                    self.fail(1, "Windows won't list Wi-Fi networks:\n\n" + tx(blocked))
+                    return
+                self.candidates, _ = wam.visible_networks(self.iface)
+                if not self.candidates:
+                    self.fail(1, "I couldn't find the speaker's setup Wi-Fi. Hold the button a "
+                              "bit longer (or unplug the speaker for 10 seconds first) and try "
+                              "again. If it never appears, use WPS or an Ethernet cable instead.")
+                    return
+                text = ("I didn't recognise the speaker's Wi-Fi by name. If one of these is "
+                        "it, pick it. Otherwise hold the button a bit longer and search again.")
+            self.ui(self.show_candidates, text)
+
+    def show_candidates(self, text: str) -> None:
+        options = self.query_one("#hotspots", OptionList)
+        options.clear_options()
+        options.add_options([Option(Text(f"{n['ssid']}   ({n['auth'] or '?'})")) for n in self.candidates])
+        options.highlighted = 0
+        self.goto(1, "pick-hotspot", text)
+
+    @on(OptionList.OptionSelected, "#hotspots")
+    @on(Button.Pressed, "#use-hotspot")
+    def use_hotspot(self) -> None:
+        index = self.query_one("#hotspots", OptionList).highlighted
+        if index is not None:
+            self.goto(2, "busy", "")
+            self.connect_worker(self.candidates[index])
+
+    @work(thread=True, group="wifi")
+    def connect_worker(self, hotspot: dict[str, str]) -> None:
+        with self.net_lock:
+            if not self.cancelled.is_set():
+                self.connect(hotspot)
+
+    def connect(self, hotspot: dict[str, str]) -> None:
+        """Steps 3-4, in a worker that holds the lock."""
+        self.ui(self.goto, 2, "busy", f"Connecting this PC's Wi-Fi ({tx(self.iface)}) to "
+                f"[b]{tx(hotspot['ssid'])}[/b]...")
+        self.previous = wam.current_profile(self.iface)
+        self.connected = True
+        self.app.wifi_cleanup = (self.iface, self.previous)
+        try:
+            wam.connect_hotspot(self.iface, hotspot["ssid"], hotspot["auth"])
+        except RuntimeError as exc:
+            self.fail(2, "Windows refused the Wi-Fi change:\n\n" + tx(str(exc)))
+            return
+        self.ip = wam.wait_for_speaker_ip(self.iface, self.port, self.SPEAKER_TIMEOUT,
+                                         self.ticker("Waiting for the speaker..."))
+        if self.cancelled.is_set():
+            return
+        if not self.ip:
+            self.fail(2, "Connected, but the speaker didn't answer. Try again, or check "
+                      "Windows' Wi-Fi status for the speaker network.")
+            return
+        self.spk_name = wam.speaker_name(self.ip, self.port) or "the speaker"
+        self.mac = wam.speaker_mac(self.ip, self.port)
+        self.ui(self.goto, 3, "busy", f"Asking [b]{tx(self.spk_name)}[/b] which networks it can "
+                "see (takes a few seconds)...")
+        self.homes = wam.speaker_networks(self.ip, self.port)
+        self.ui(self.show_homes)
+
+    def show_homes(self) -> None:
+        options = self.query_one("#homes", OptionList)
+        options.clear_options()
+        options.add_options([Option(Text(f"{r['ssid']}" + (f"   signal {r['rssi']}" if r.get("rssi") else "")))
+                             for r in self.homes])
+        options.display = bool(self.homes)
+        self.query_one("#ssid", Input).value = self.homes[0]["ssid"] if self.homes else ""
+        if self.homes:
+            options.highlighted = 0
+            text = (f"Talking to [b]{tx(self.spk_name)}[/b]. Which network should it join? "
+                    "Pick the 2.4 GHz one if your router has separate names.")
+        else:
+            text = (f"Talking to [b]{tx(self.spk_name)}[/b]. It didn't send a list of networks, "
+                    "so type the name yourself.")
+        self.goto(3, "home", text)
+
+    @on(OptionList.OptionHighlighted, "#homes")
+    def home_highlighted(self, event: OptionList.OptionHighlighted) -> None:
+        self.query_one("#ssid", Input).value = self.homes[event.option_index]["ssid"]
+
+    @on(OptionList.OptionSelected, "#homes")
+    @on(Input.Submitted, "#ssid")
+    def to_password(self) -> None:
+        self.query_one("#password", Input).focus()
+
+    @on(Input.Submitted, "#password")
+    @on(Button.Pressed, "#send")
+    def send_details(self) -> None:
+        target = self.query_one("#ssid", Input).value.strip()
+        password = self.query_one("#password", Input).value
+        if not target:
+            self.notify("Pick or type the network name first.", severity="warning")
+            return
+        index = self.query_one("#homes", OptionList).highlighted
+        picked = self.homes[index] if self.homes and index is not None else None
+        if picked and picked["ssid"] == target:
+            ssid, index = None, int(picked["index"])
+        elif "]]>" in target:
+            self.notify("That network name can't be used.", severity="error")
+            return
+        else:
+            ssid, index = target, None
+        warnings = wam.password_warnings(password)
+        message = f'Send "{target}" to {self.spk_name}?' + "".join("\n\n" + w for w in warnings)
+
+        def confirmed(ok: bool | None) -> None:
+            if ok:
+                self.query_one("#password", Input).value = ""
+                self.goto(4, "busy", f"Sending your Wi-Fi details to [b]{tx(self.spk_name)}[/b]...")
+                self.send_worker(target, ssid, index, password)
+
+        self.app.push_screen(ConfirmScreen("Send Wi-Fi details", message, yes="Send"), confirmed)
+
+    @work(thread=True, group="wifi")
+    def send_worker(self, target: str, ssid: str | None, index: int | None, password: str) -> None:
+        with self.net_lock:
+            if self.cancelled.is_set():
+                return
+            command = wam.join_command(password, ssid, index, "wpa" if password else "none")
+            try:
+                reply = wam.response_fields(wam.send(self.ip, command, self.port, wait=10.0)).get("result")
+            except OSError:
+                reply = ""
+            self.ui(self.set_status, f"Speaker replied: {reply or 'nothing (normal, it is switching networks)'}. "
+                    "Reconnecting this PC's own Wi-Fi...")
+            self.disconnect()
+            self.ui(self.goto, 5, "busy", f"Waiting for [b]{tx(self.spk_name)}[/b] to show up on "
+                    f"your network (up to {self.HOME_TIMEOUT / 60:.0f} minutes)...")
+            start = time.monotonic()
+            while time.monotonic() - start < self.HOME_TIMEOUT:
+                self.ui(self.set_status, f"Searching... {time.monotonic() - start:.0f} s")
+                if self.cancelled.wait(self.HOME_POLL):
+                    return
+                found = wam.find_set_up_speaker(self.spk_name, self.mac, self.port)
+                if found:
+                    self.result, spk = found
+                    ap = wam.response_fields(wam.send(self.result, wam.CMD_GET_AP_INFO, self.port))
+                    on_wifi = f' on Wi-Fi "{tx(ap["ssid"])}"' if ap.get("ssid") else ""
+                    self.ui(self.goto, 6, "done", f'[green]Done![/green] [b]{tx(spk)}[/b] is at '
+                            f"{self.result}{on_wifi}. It's added to your speaker list.")
+                    return
+            self.ui(self.goto, 5, "done",
+                    "I can't see the speaker on the networks I search. If its light has stopped "
+                    f'blinking it probably worked: "{tx(target)}" may be a separate network '
+                    "(an IoT or guest network/VLAN). Press [b]n[/b] in the speaker list to add that "
+                    "network, then [b]s[/b] to scan.\n\nIf the light still blinks, the name or "
+                    "password was probably wrong: run the setup again and pick the network from "
+                    "the list.", failed=True)
+
+    # ---- leaving --------------------------------------------------------
+
+    @on(Button.Pressed, ".cancel")
+    def action_cancel(self) -> None:
+        if self.closing:
+            return
+        self.closing = True
+        self.cancelled.set()
+        if self.net_lock.locked() or self.connected:
+            self.goto(self.step, "busy", "Stopping" + (" and reconnecting this PC's own Wi-Fi..."
+                                                       if self.connected else "..."))
+        self.close_worker()
+
+    @work(thread=True, group="wifi-close")
+    def close_worker(self) -> None:
+        with self.net_lock:  # waits for the running step to notice self.cancelled
+            self.disconnect()
+        self.app.call_from_thread(self.finish)
+
+
+# --------------------------------------------------------------------------
 # Main screen
 # --------------------------------------------------------------------------
 
@@ -195,6 +549,16 @@ class SpeakerApp(App):
     #dialog OptionList { height: auto; max-height: 10; margin-bottom: 1; }
     .buttons { height: auto; align-horizontal: right; margin-top: 1; }
     .buttons Button { margin-left: 1; }
+    #wifi { height: 1fr; }
+    #steps { width: 38; border: round $accent; padding: 1 1; }
+    #wifi-body { padding: 1 2; }
+    #wifi-text { margin-bottom: 1; }
+    #pane, #pane > Vertical { height: auto; }
+    #pane OptionList { height: auto; max-height: 12; margin-bottom: 1; }
+    #busy LoadingIndicator { height: 3; }
+    #busy-status { color: $text-muted; }
+    #pane .buttons { align-horizontal: left; }
+    #pane .buttons Button { margin-left: 0; margin-right: 1; }
     """
     BINDINGS = [
         Binding("r", "refresh", "Refresh"),
@@ -217,6 +581,19 @@ class SpeakerApp(App):
         self.rows: dict[str, Row] = {}
         self.marked: set[str] = set()
         self.volume_timers: dict = {}
+        self.wifi_cleanup: tuple[str, str] | None = None  # set while the PC is on a speaker's hotspot
+
+    MAIN_ACTIONS = {"refresh", "scan", "mark", "group", "ungroup", "volume", "add", "forget",
+                    "networks", "wifi"}
+
+    def check_action(self, action: str, parameters: tuple) -> bool | None:
+        """Main-screen keys don't act behind a dialog; no quitting mid Wi-Fi setup."""
+        if len(self.screen_stack) > 1:
+            if action in self.MAIN_ACTIONS:
+                return False
+            if action == "quit" and any(isinstance(s, WifiSetupScreen) for s in self.screen_stack):
+                return False
+        return True
 
     # ---- layout ---------------------------------------------------------
 
@@ -299,17 +676,17 @@ class SpeakerApp(App):
             panel.update("No speakers yet.\n\nPress [b]s[/b] to scan or [b]a[/b] to add one by IP.")
             return
         if r.role == "main":
-            group = f'main of "{escape(r.group)}"'
+            group = f'main of "{tx(r.group)}"'
         elif r.role == "sub":
-            group = f"member, main is {escape(self.name_of(r.main_ip))}"
+            group = f"member, main is {tx(self.name_of(r.main_ip))}"
         else:
             group = "not grouped"
         state = {None: "checking…", False: "[red]offline[/red]", True: "[green]online[/green]"}[r.online]
-        lines = [f"[b]{escape(r.name or r.ip)}[/b]  {state}", "",
-                 f"IP        {r.ip}", f"MAC       {escape(r.mac)}", f"Model     {escape(r.model)}"]
+        lines = [f"[b]{tx(r.name or r.ip)}[/b]  {state}", "",
+                 f"IP        {r.ip}", f"MAC       {tx(r.mac)}", f"Model     {tx(r.model)}"]
         if r.online:
-            lines += [f"Firmware  {escape(r.firmware)}",
-                      f"Network   {escape(r.ssid)} ({escape(r.conn)})" if r.ssid else f"Network   {escape(r.conn)}",
+            lines += [f"Firmware  {tx(r.firmware)}",
+                      f"Network   {tx(r.ssid)} ({tx(r.conn)})" if r.ssid else f"Network   {tx(r.conn)}",
                       f"Signal    {r.rssi}/5" if r.rssi else "Signal    ?",
                       f"Volume    {r.volume}/{MAX_VOLUME}" if r.volume is not None else "Volume    ?",
                       f"Group     {group}"]
@@ -539,26 +916,22 @@ class SpeakerApp(App):
             "included):", value=", ".join(wam.load_subnets()), placeholder="192.168.10.0/24"), done)
 
     def action_wifi(self) -> None:
-        self.exit("wifi")
+        def done(ip: str | None) -> None:
+            if ip:
+                self.add_worker(ip)
+
+        self.push_screen(WifiSetupScreen(self.port), done)
 
 
 def run(port: int = wam.PORT) -> int:
-    scan = False
-    while True:
-        result = SpeakerApp(port, scan_on_start=scan).run()
-        if result != "wifi":
-            return 0
-        try:
-            wam.easy_mode(port)
-        except KeyboardInterrupt:
-            print("\nStopped.")
-        except RuntimeError as exc:
-            print(f"\nWindows refused the Wi-Fi change:\n    {exc}")
-        try:
-            input("\nPress Enter to go back to the speaker list...")
-        except (EOFError, KeyboardInterrupt):
-            return 0
-        scan = True
+    app = SpeakerApp(port)
+    try:
+        app.run()
+    finally:
+        if app.wifi_cleanup:  # closed in the middle of Wi-Fi setup: put this PC's Wi-Fi back
+            print("Reconnecting this PC's own Wi-Fi...")
+            wam.disconnect_hotspot(*app.wifi_cleanup)
+    return 0
 
 
 if __name__ == "__main__":

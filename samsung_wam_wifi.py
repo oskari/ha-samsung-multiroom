@@ -74,6 +74,7 @@ import uuid
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from typing import Callable
 
 PORT = 55001
 IS_WINDOWS = os.name == "nt"
@@ -444,7 +445,22 @@ def ask(prompt: str) -> str:
     return input("    " + prompt).strip()
 
 
-def wait_for_hotspot(iface: str, timeout: float = 90) -> list[dict[str, str]]:
+def dot(seconds: float = 3) -> bool:
+    """Default progress tick for the waits below: print a dot, pause, keep going."""
+    print(".", end="", flush=True)
+    time.sleep(seconds)
+    return True
+
+
+def location_blocked(iface: str) -> str:
+    """Windows' message if it refuses to list Wi-Fi networks (location off), else ''."""
+    nets, raw = visible_networks(iface)
+    return raw.strip() if not nets and "location" in raw.lower() else ""
+
+
+# The waits call tick() between tries; tick pauses and returns False to give up early.
+def wait_for_hotspot(iface: str, timeout: float = 90,
+                     tick: Callable[[], bool] = dot) -> list[dict[str, str]]:
     deadline, next_scan = time.monotonic() + timeout, 0.0
     while time.monotonic() < deadline:
         if time.monotonic() >= next_scan:
@@ -453,18 +469,16 @@ def wait_for_hotspot(iface: str, timeout: float = 90) -> list[dict[str, str]]:
         nets, raw = visible_networks(iface)
         hits = [n for n in nets if is_speaker_hotspot(n["ssid"])]
         if hits:
-            print()
             return hits
         if not nets and "location" in raw.lower():
-            print("\n    Windows won't list Wi-Fi networks:\n    " + raw.strip())
             return []
-        print(".", end="", flush=True)
-        time.sleep(3)
-    print()
+        if not tick():
+            return []
     return []
 
 
-def wait_for_speaker_ip(iface: str, port: int, timeout: float = 45) -> str | None:
+def wait_for_speaker_ip(iface: str, port: int, timeout: float = 45,
+                        tick: Callable[[], bool] = dot) -> str | None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         gateway, address = wifi_address(iface)
@@ -477,24 +491,52 @@ def wait_for_speaker_ip(iface: str, port: int, timeout: float = 45) -> str | Non
             found = find_speakers([net], port)
             if found:
                 return found[0][0]
-        print(".", end="", flush=True)
-        time.sleep(3)
+        if not tick():
+            return None
+    return None
+
+
+def speaker_networks(ip: str, port: int) -> list[dict[str, str]]:
+    """Wi-Fi networks the speaker can see, strongest first (each has index and ssid)."""
+    try:
+        rows = ap_list(send(ip, CMD_GET_AP_LIST, port, wait=15.0))
+    except OSError:
+        return []
+    usable = [r for r in rows if r.get("index", "").isdigit() and (r.get("ssid") or r.get("apname"))]
+    for r in usable:
+        r["ssid"] = r.get("ssid") or r.get("apname", "")
+    return usable
+
+
+def speaker_mac(ip: str, port: int) -> str:
+    try:
+        return response_fields(send(ip, "<name>GetMainInfo</name>", port)).get("spkmacaddr", "")
+    except OSError:
+        return ""
+
+
+def find_set_up_speaker(name: str | None, mac: str, port: int) -> tuple[str, str] | None:
+    """(ip, name) of the speaker that just joined, searching saved networks and this PC's.
+
+    Matched by MAC when known, else by name, so other speakers aren't mistaken for it.
+    """
+    for ip, spk in find_speakers(networks([]), port):
+        if mac and speaker_mac(ip, port).lower() == mac.lower():
+            return ip, spk
+        if not mac and spk == name:
+            return ip, spk
     return None
 
 
 def choose_network(ip: str, port: int) -> tuple[str | None, int | None, str]:
     """Ask which network to join. Returns (ssid, index, label)."""
     print("    Asking the speaker which networks it can see (takes a few seconds)...")
-    try:
-        rows = ap_list(send(ip, CMD_GET_AP_LIST, port, wait=15.0))
-    except OSError:
-        rows = []
-    usable = [r for r in rows if r.get("index", "").isdigit() and (r.get("ssid") or r.get("apname"))]
+    usable = speaker_networks(ip, port)
     if usable:
         print("    Networks the speaker can see:")
         for n, r in enumerate(usable, 1):
             extra = f"  (signal {r['rssi']})" if r.get("rssi") else ""
-            print(f"      {n:>2}. {r.get('ssid') or r.get('apname')}{extra}")
+            print(f"      {n:>2}. {r['ssid']}{extra}")
         print("    Pick the 2.4 GHz one if your router has separate names.")
         choice = ask("Type its number, or type the network name: ")
     else:
@@ -502,7 +544,7 @@ def choose_network(ip: str, port: int) -> tuple[str | None, int | None, str]:
         choice = ask("Network name: ")
     if choice.isdigit() and usable and 1 <= int(choice) <= len(usable):
         r = usable[int(choice) - 1]
-        return None, int(r["index"]), r.get("ssid") or r.get("apname", "")
+        return None, int(r["index"]), r["ssid"]
     return choice, None, choice
 
 
@@ -533,6 +575,10 @@ def easy_mode(port: int = PORT) -> int:
     step(2, "Looking for the speaker's setup Wi-Fi (up to 90 seconds)")
     print("    ", end="", flush=True)
     hits = wait_for_hotspot(iface)
+    print()
+    if not hits and location_blocked(iface):
+        print("    Windows won't list Wi-Fi networks:\n    " + location_blocked(iface))
+        return 1
     if not hits:
         nets, _ = visible_networks(iface)
         if nets:
@@ -569,6 +615,7 @@ def easy_mode(port: int = PORT) -> int:
                   "    check Windows' Wi-Fi status for the speaker network.")
             return 1
         name = speaker_name(ip, port) or "the speaker"
+        mac = speaker_mac(ip, port)
         print(f"    Talking to \"{name}\" at {ip}.")
 
         step(4, "Choose your home Wi-Fi")
@@ -603,14 +650,13 @@ def easy_mode(port: int = PORT) -> int:
     deadline = time.monotonic() + 180
     while time.monotonic() < deadline:
         time.sleep(10)
-        found = find_speakers(port=port)
-        mine = [f for f in found if f[1] == name] or found
-        if mine:
-            ip, spk = mine[0]
+        found = find_set_up_speaker(name, mac, port)
+        if found:
+            ip, spk = found
             info = response_fields(send(ip, CMD_GET_AP_INFO, port))
             print(f"\n\n    Done! \"{spk}\" is at {ip}"
                   + (f", on Wi-Fi \"{info['ssid']}\"." if info.get("ssid") else "."))
-            print("    Now open Spotify, tap the Devices icon and pick the speaker.")
+            remember_speakers([s for s in [speaker_state(ip, port)] if s])
             return 0
         print(".", end="", flush=True)
     print(f"\n\n    I can't see the speaker on this PC's network. If its light has stopped\n"
