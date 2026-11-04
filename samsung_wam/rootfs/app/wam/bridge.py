@@ -35,7 +35,8 @@ BYTES_PER_SEC = RATE * CHANNELS * WIDTH      # of the 16-bit stream sent to the 
 CAPTURE_FRAME = CHANNELS * 4                 # captured as 32-bit float
 CHUNK = 4096                                 # bytes of 16-bit output per queue item
 QUEUE_CHUNKS = 90              # ~2 s between capture and the speaker
-IDLE_CLOSE = 10 * 60
+IDLE_CLOSE = 10 * 60          # paused on this device: end the speaker stream after this
+MOVED_AWAY_CLOSE = 60         # Spotify moved to another device: end it sooner
 WS_BASE_PORT = 9100
 
 # Volume modes (cfg["volume_mode"]):
@@ -118,6 +119,7 @@ class Bridge:
         self.vol_ev = threading.Event()      # wakes the volume sender (speaker mode)
         self.backoff = 0.0                   # seconds to wait before re-offering the stream
         self.next_start = 0.0
+        self.stream_closed = threading.Event()  # set once a stream ended and was tidied up
         self.gains = (1.0, 1.0)              # speaker mode: undoes Soloist's stream volume
         self.prev_gains = (1.0, 1.0)
         self.gains_settle_until = 0.0
@@ -189,8 +191,13 @@ class Bridge:
             self.stop()
 
     def stop(self) -> None:
+        was_streaming = self.streaming.is_set()
         self.stop_ev.set()
         self.end_stream.set()
+        if was_streaming:
+            # Let the stream handler restore the volume and release the speaker
+            # before we go (e.g. when the app is shut down or restarted).
+            self.stream_closed.wait(8)
         for name, p in list(self.procs.items()):
             if p.poll() is None:
                 p.terminate()
@@ -482,10 +489,15 @@ class Bridge:
                 silent_since = 0.0
                 if time.monotonic() >= self.next_start:
                     self._start_speaker()
-            elif (self.streaming.is_set() and not playing and self.not_playing_since
-                  and time.monotonic() - self.not_playing_since > IDLE_CLOSE):
-                self.log("not playing for a while; ending the speaker stream")
-                self.end_stream.set()
+            elif self.streaming.is_set() and not playing and self.not_playing_since:
+                # Paused here: keep the stream (silent, volume 0) so play resumes at
+                # once, for up to IDLE_CLOSE. Moved to another device: let go sooner.
+                idle = time.monotonic() - self.not_playing_since
+                limit = IDLE_CLOSE if self.active else MOVED_AWAY_CLOSE
+                if idle > limit:
+                    self.log("not playing for a while; ending the speaker stream" if self.active
+                             else "Spotify moved to another device; ending the speaker stream")
+                    self.end_stream.set()
             if not playing:
                 silent_since = 0.0
 
@@ -537,6 +549,7 @@ class Bridge:
             while not self.pcm.empty():
                 self.pcm.get_nowait()
             self.end_stream.clear()
+            self.stream_closed.clear()
             self.streaming.set()
             started = last_write = time.monotonic()
             while not self.stop_ev.is_set() and not self.end_stream.is_set():
@@ -557,6 +570,10 @@ class Bridge:
         except OSError as exc:
             self.log(f"the speaker closed the stream ({exc.__class__.__name__})")
         finally:
+            # Only release the speaker when *we* ended the stream. If the speaker
+            # hung up itself (e.g. someone switched it to Bluetooth), a pause
+            # would pause whatever it plays now.
+            ended_by_us = self.end_stream.is_set() or self.stop_ev.is_set()
             lasted = time.monotonic() - started if "started" in locals() else 0.0
             # A stream the speaker drops quickly is retried with growing pauses
             # (5 s up to a minute) instead of hammering it; a healthy one resets that.
@@ -567,7 +584,19 @@ class Bridge:
             if self.muted_for_pause and self.level is not None:
                 self._speaker(lambda: protocol.set_volume(self.speaker_ip, self.level), "restore volume")
                 self.muted_for_pause = False
+            if ended_by_us:
+                # A speaker still holding a URL session whose source is gone never
+                # starts its standby countdown; releasing it lets it go dark by
+                # itself (~15-20 min later, as with Samsung's own apps).
+                try:
+                    result = protocol.release(self.speaker_ip)
+                    self.log({"released": "released the speaker, so it can go to standby",
+                              "already": "the speaker had already let go of the stream"}.get(
+                                  result, "the speaker didn't answer the release"))
+                except protocol.SpeakerError as exc:
+                    self.log(f"couldn't release the speaker: {exc}")
             self.log("stream ended")
+            self.stream_closed.set()
 
 
 class BridgeManager:
@@ -639,8 +668,13 @@ class BridgeManager:
             b.start()
 
     def stop_all(self) -> None:
-        for b in self.bridges.values():
-            b.stop()
+        # In parallel: each stop may wait a few seconds to release its speaker,
+        # and Supervisor only gives the app about 10 s to shut down.
+        threads = [threading.Thread(target=b.stop, daemon=True) for b in self.bridges.values()]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(9)
 
     def _free_ws_port(self) -> int:
         used = {b.ws_port for b in self.bridges.values()}

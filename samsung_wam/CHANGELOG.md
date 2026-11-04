@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.1
+
+- Speakers can go to standby again. When the app ends a speaker stream (after
+  10 minutes paused, when the app stops, or when a bridge restarts), it now
+  releases the speaker; before, the speaker kept waiting for the ended stream
+  and stayed awake. It isn't sent when the speaker itself hangs up (e.g. after
+  switching it to Bluetooth), so it can't pause anything else.
+- When Spotify moves playback to another device, the speaker stream ends after
+  1 minute instead of 10.
+- Installs download a prebuilt image instead of building it on your machine.
+
 ## 0.2.0
 
 - Choose per Spotify bridge how Spotify's volume slider works: it either

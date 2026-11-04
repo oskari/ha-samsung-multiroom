@@ -21,9 +21,12 @@ _guard = threading.Lock()
 
 # Replies whose method name differs from the command (Get/Set prefix aside).
 _REPLY = {
-    "GetVolume": "VolumeLevel", "SetVolume": "VolumeLevel",
-    "GetMute": "MuteStatus", "SetMute": "MuteStatus",
-    "GetFunc": "CurrentFunc", "SetFunc": "CurrentFunc",
+    "GetVolume": ("VolumeLevel",), "SetVolume": ("VolumeLevel",),
+    "GetMute": ("MuteStatus",), "SetMute": ("MuteStatus",),
+    "GetFunc": ("CurrentFunc",), "SetFunc": ("CurrentFunc",),
+    # Measured on a Shape M3 for "pause": PausePlaybackEvent/ok when it let go of
+    # a stream, PlaybackStatus/ng when there was nothing to pause.
+    "SetPlaybackControl": ("PausePlaybackEvent", "PlaybackStatus"),
 }
 
 # Security labels as the speaker expects them in SetApManual.
@@ -69,7 +72,7 @@ def request(ip: str, method: str, params: str = "", pwron: bool = False,
             wait: float = 5.0, port: int = PORT) -> dict:
     """Send one command; return the matching reply {method, result, fields, xml}."""
     body = ("<pwron>on</pwron>" if pwron else "") + f"<name>{method}</name>" + params
-    hints = {method, re.sub(r"^(Get|Set)", "", method), _REPLY.get(method, method)}
+    hints = {method, re.sub(r"^(Get|Set)", "", method), *_REPLY.get(method, ())}
     hint_re = re.compile(rb"<method>(" + "|".join(sorted(hints)).encode() + rb")</method>")
     req = (f"GET /UIC?cmd={urllib.parse.quote(body)} HTTP/1.1\r\nHost: {ip}:{port}\r\n"
            f"mobileUUID: {_UID}\r\nmobileName: Wireless Audio\r\nmobileVersion: 1.0\r\n\r\n").encode()
@@ -163,6 +166,24 @@ def play_url(ip: str, url: str) -> bool:
     r = request(ip, "SetUrlPlayback", p_cdata("url", url) + p_dec("buffersize", 0)
                 + p_dec("seektime", 0) + p_dec("resume", 0), wait=10)
     return ok(r) and r["method"] == "UrlPlayback"
+
+
+def release(ip: str) -> str:
+    """Let go of a URL stream so the speaker can idle into standby.
+
+    A speaker still holding a SetUrlPlayback session whose source is gone never
+    starts its standby countdown (measured by the wambridge project on an M5).
+    UIC "pause" releases it; "stop" is refused for URL playback. No pwron, so it
+    doesn't wake a speaker that is already dark.
+
+    Returns "released", "already" (nothing was held) or "no reply".
+    """
+    r = request(ip, "SetPlaybackControl", p_str("playbackcontrol", "pause"), wait=3)
+    if r["method"] == "PausePlaybackEvent" or (r["method"] != "PlaybackStatus" and ok(r)):
+        return "released"
+    if r["method"] == "PlaybackStatus":
+        return "already"
+    return "no reply"
 
 
 def set_ap_manual(ip: str, ssid: str, password: str, security: str = "wpa") -> dict:

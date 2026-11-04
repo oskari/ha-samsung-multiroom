@@ -37,8 +37,8 @@ Speakers** panel to Home Assistant's sidebar:
    repository.) Or do it by hand: **Settings → Apps → App store**, open the
    **⋮** menu → **Repositories**, and add
    `https://github.com/oskari/ha-samsung-multiroom`.
-2. Install **Samsung Multiroom Speakers**. Home Assistant builds it on your
-   machine, which takes a few minutes.
+2. Install **Samsung Multiroom Speakers**. Home Assistant downloads a prebuilt
+   image for your machine.
 3. For Spotify: create a Soloist API key at
    <https://developer.spotify.com/dashboard/soloist> (needs Spotify Premium).
    In the app's **Configuration** tab, turn on **Accept Spotify's terms for

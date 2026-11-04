@@ -1,10 +1,13 @@
 name: Samsung Multiroom Speakers
-version: "0.2.0"
+version: "0.2.1"
 slug: samsung_wam
 description: >-
   Wi-Fi setup, grouping and a Spotify Connect bridge for Samsung Wireless Audio
   Multiroom speakers (Shape M3/M5/M7, Radiant R1-R7)
 url: https://github.com/oskari/ha-samsung-multiroom
+# Prebuilt by .github/workflows/ci.yaml; Home Assistant downloads it instead of
+# building the Dockerfile on each machine.
+image: ghcr.io/oskari/samsung-multiroom
 arch:
   - amd64
   - aarch64
