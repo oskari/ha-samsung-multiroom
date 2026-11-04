@@ -36,6 +36,17 @@ reachable with **Open web UI**).
 
 Audio reaches the speaker about 2–3 seconds after Spotify shows it.
 
+### Volume
+
+Each bridge has a **Volume control** setting:
+
+- **Spotify scales the audio** (default): Spotify's slider changes the audio
+  level, heard after 2–3 seconds. The speaker's own volume stays fixed (or
+  where you leave it).
+- **Spotify sets the speaker volume**: Spotify's slider sets the speaker's own
+  volume, within about a second. **Loudest speaker volume** is the speaker
+  level at Spotify 100% (10/30 by default); start low and raise it if needed.
+
 ## Networking
 
 The speakers fetch audio from this host on the **stream port** (8099). If the
