@@ -199,7 +199,8 @@ class App:
         if parts == ["bridges"]:
             spk = self.speaker(body["speaker_ip"])
             vol = body.get("speaker_volume")
-            b = self.m.add(body.get("name", ""), spk, int(vol) if vol not in (None, "") else None)
+            b = self.m.add(body.get("name", ""), spk, int(vol) if vol not in (None, "") else None,
+                           body.get("volume_mode") or "stream")
             return 200, b.info()
         if len(parts) == 3 and parts[0] == "bridges":
             bid, action = parts[1], parts[2]
@@ -218,6 +219,8 @@ class App:
                     changes["speaker_volume"] = int(v) if v not in (None, "") else None
                 if body.get("name"):
                     changes["name"] = body["name"].strip()
+                if body.get("volume_mode"):
+                    changes["volume_mode"] = body["volume_mode"]
                 self.m.update(bid, changes)
                 if "name" in changes:
                     self.m.restart(bid)

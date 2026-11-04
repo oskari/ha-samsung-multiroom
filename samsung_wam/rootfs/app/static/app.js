@@ -6,6 +6,29 @@ const $$ = (sel, el = document) => [...el.querySelectorAll(sel)];
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
   (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Inside Home Assistant's sidebar the panel is an ingress iframe on HA's own
+// origin, so it can read the user's profile settings (language, time format)
+// from the surrounding page. Outside HA, the browser's language is used.
+function haLocale() {
+  try {
+    if (window.parent === window) return null;
+    const ha = window.parent.document.querySelector("home-assistant");
+    return (ha && ha.hass && ha.hass.locale) || null;
+  } catch (e) {
+    return null;  // not inside HA, or not the same origin
+  }
+}
+
+function formatTime(date) {
+  const opts = { hour: "2-digit", minute: "2-digit", second: "2-digit" };
+  const loc = haLocale();
+  if (!loc || loc.time_format === "system") return date.toLocaleTimeString(undefined, opts);
+  if (loc.time_format === "12") opts.hour12 = true;
+  else if (loc.time_format === "24") opts.hour12 = false;
+  return date.toLocaleTimeString(loc.language || undefined, opts);  // "language": HA's language decides
+}
+
 let S = null;            // latest /api/status
 const rendered = {};     // section -> last rendered JSON, to avoid needless redraws
 
@@ -67,6 +90,24 @@ const bridgeForMac = (mac) => (S?.bridges || []).find((b) => b.speaker_mac === m
 function volumeOptions(selected) {
   let html = `<option value="">Keep the speaker's own volume</option>`;
   for (let v = 1; v <= 30; v++) html += `<option value="${v}" ${String(selected) === String(v) ? "selected" : ""}>${v} / 30</option>`;
+  return html;
+}
+
+// Volume modes: "stream" = Spotify scales the audio, speaker volume fixed;
+// "speaker" = Spotify's slider sets the speaker's own volume (up to a maximum).
+const MODES = {
+  stream: "Spotify scales the audio",
+  speaker: "Spotify sets the speaker volume",
+};
+const modeOptions = (selected) => Object.entries(MODES)
+  .map(([v, label]) => `<option value="${v}" ${selected === v ? "selected" : ""}>${esc(label)}</option>`).join("");
+const levelLabel = (mode) => mode === "speaker" ? "Loudest speaker volume (Spotify at 100%)" : "Speaker volume while playing";
+
+function levelOptions(mode, selected) {
+  if (mode !== "speaker") return volumeOptions(selected);
+  const sel = String(selected || 10);
+  let html = "";
+  for (let v = 1; v <= 30; v++) html += `<option value="${v}" ${sel === String(v) ? "selected" : ""}>${v} / 30</option>`;
   return html;
 }
 
@@ -206,10 +247,16 @@ function renderSpotify() {
         <dl class="kv">
           ${b.track ? `<dt>Track</dt><dd>${esc(b.track)}</dd>` : ""}
           ${b.spotify_volume != null ? `<dt>Spotify volume</dt><dd>${esc(b.spotify_volume)}%</dd>` : ""}
+          ${b.speaker_level != null ? `<dt>Speaker volume</dt><dd>${esc(b.speaker_level)} / 30</dd>` : ""}
           <dt>Stream</dt><dd>${b.streaming ? `connected <span class="muted small">${b.rate ? b.rate.toFixed(2) + "×" : ""}</span>` : '<span class="muted">idle</span>'}</dd>
         </dl>
-        <label>Speaker volume while playing
-          <select data-bvol="${esc(b.id)}">${volumeOptions(b.speaker_volume)}</select></label>
+        <label>Volume control
+          <select data-bmode="${esc(b.id)}">${modeOptions(b.volume_mode)}</select>
+          <span class="small">${b.volume_mode === "speaker"
+            ? "Spotify's slider sets the speaker's own volume: about a second, full quality."
+            : "Spotify's slider changes the audio level: heard after 2–3 s; the speaker's volume stays fixed."}</span></label>
+        <label>${esc(levelLabel(b.volume_mode))}
+          <select data-bvol="${esc(b.id)}">${levelOptions(b.volume_mode, b.speaker_volume)}</select></label>
         <div class="actions">
           <button class="secondary" data-bpair="${esc(b.id)}">Pair again</button>
           <button class="secondary" data-brestart="${esc(b.id)}">Restart</button>
@@ -225,7 +272,10 @@ function renderSpotify() {
     ? free.map((s) => [s.ip, `${s.name} (${s.ip})${s.role === "main" ? " – whole group" : ""}`])
     : [["", S.speakers.length ? "Every speaker already has a Spotify bridge" : "No speakers found yet"]]);
   $("#bridge-add").disabled = !free.length;
-  if (!$("#bridge-volume").options.length) $("#bridge-volume").innerHTML = volumeOptions("");
+  if (!$("#bridge-mode").options.length) {
+    $("#bridge-mode").innerHTML = modeOptions("stream");
+    $("#bridge-volume").innerHTML = levelOptions("stream", "");
+  }
 }
 
 // ---------------------------------------------------------------- refresh
@@ -237,7 +287,7 @@ async function refresh() {
     return;
   }
   $("#scan-info").textContent = S.scanning ? "Searching…" :
-    S.last_scan ? `Last search ${new Date(S.last_scan * 1000).toLocaleTimeString()}` : "";
+    S.last_scan ? `Last search ${formatTime(new Date(S.last_scan * 1000))}` : "";
   $("#scan-btn").disabled = S.scanning;
   renderSpeakers();
   renderSubnets();
@@ -340,7 +390,7 @@ document.addEventListener("click", async (ev) => {
   });
   if (t.id === "bridge-add") return guarded(t, async () => {
     await api("bridges", { speaker_ip: $("#bridge-speaker").value, name: $("#bridge-name").value,
-      speaker_volume: $("#bridge-volume").value });
+      speaker_volume: $("#bridge-volume").value, volume_mode: $("#bridge-mode").value });
     $("#bridge-name").value = "";
     toast("Added. Now pick it in Spotify's Devices list once to link it to your account.", 8000);
   });
@@ -384,6 +434,14 @@ document.addEventListener("change", (ev) => {
     guarded(null, () => api("speaker/volume", { ip: t.dataset.vol, volume: parseInt(t.value, 10) }));
   } else if (t.dataset.bvol) {
     guarded(null, () => api(`bridges/${t.dataset.bvol}/update`, { speaker_volume: t.value }));
+  } else if (t.dataset.bmode) {
+    // The level setting means something different in each mode, so reset it.
+    const b = (S?.bridges || []).find((x) => x.id === t.dataset.bmode);
+    const level = t.value === "speaker" ? (b?.speaker_volume || 10) : "";
+    guarded(null, () => api(`bridges/${t.dataset.bmode}/update`, { volume_mode: t.value, speaker_volume: level }));
+  } else if (t.id === "bridge-mode") {
+    $("#bridge-volume-label").textContent = levelLabel(t.value);
+    $("#bridge-volume").innerHTML = levelOptions(t.value, "");
   } else if (t.id === "group-main") {
     $("#group-name").value = "";
     renderGroupMembers();
