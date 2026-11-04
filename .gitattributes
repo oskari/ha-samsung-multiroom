@@ -1,0 +1,4 @@
+# Keep LF everywhere: the app's files run inside a Linux container
+# (a CRLF in run.sh breaks it), and PowerShell is fine with LF.
+* text=auto eol=lf
+*.png binary

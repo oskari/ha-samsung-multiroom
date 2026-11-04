@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Samsung Speakers</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>Samsung Speakers</h1>
+    <div class="head-actions">
+      <span id="scan-info" class="muted"></span>
+      <button id="scan-btn" class="secondary">Search for speakers</button>
+    </div>
+  </header>
+
+  <nav id="tabs">
+    <button data-tab="speakers" class="active">Speakers</button>
+    <button data-tab="groups">Groups</button>
+    <button data-tab="spotify">Spotify</button>
+    <button data-tab="setup">New speaker</button>
+  </nav>
+
+  <main>
+    <section id="tab-speakers" class="tab active">
+      <div id="speaker-list" class="cards"></div>
+      <details class="card">
+        <summary>Speakers on another network (e.g. an IoT network)</summary>
+        <p class="muted">Add a network to search, or a speaker's address directly.</p>
+        <div class="row">
+          <input id="subnet-input" placeholder="192.168.10.0/24">
+          <button id="subnet-add" class="secondary">Add network</button>
+        </div>
+        <div id="subnet-list" class="chips"></div>
+        <div class="row">
+          <input id="ip-input" placeholder="192.168.10.50">
+          <button id="ip-add" class="secondary">Add speaker</button>
+        </div>
+      </details>
+    </section>
+
+    <section id="tab-groups" class="tab">
+      <div id="group-list" class="cards"></div>
+      <div class="card">
+        <h2>Make a group</h2>
+        <p class="muted">The main speaker plays the music; the others play along in sync.
+          A Spotify bridge on the main speaker plays to the whole group.</p>
+        <label>Main speaker <select id="group-main"></select></label>
+        <div id="group-members" class="checks"></div>
+        <label>Group name <input id="group-name" placeholder="Downstairs"></label>
+        <button id="group-create">Make group</button>
+      </div>
+    </section>
+
+    <section id="tab-spotify" class="tab">
+      <div id="spotify-status" class="card"></div>
+      <div id="bridge-list" class="cards"></div>
+      <div class="card">
+        <h2>Add a Spotify Connect speaker</h2>
+        <p class="muted">Creates a Spotify Connect device that plays on the chosen speaker
+          (or on a whole group, if you pick its main speaker).</p>
+        <label>Speaker <select id="bridge-speaker"></select></label>
+        <label>Name in Spotify <input id="bridge-name" placeholder="Living room"></label>
+        <label>Speaker volume while playing
+          <select id="bridge-volume"></select></label>
+        <button id="bridge-add">Add</button>
+      </div>
+    </section>
+
+    <section id="tab-setup" class="tab">
+      <div class="card">
+        <h2>Connect a new speaker to Wi-Fi</h2>
+        <ol class="steps">
+          <li>Plug the speaker in and switch it on.</li>
+          <li>Hold the <b>WPS/Wi-Fi SETUP</b> button on its back for about <b>5 seconds</b>,
+            until its light changes. It now offers a setup Wi-Fi called "[Samsung] ...".</li>
+          <li>Below, find that Wi-Fi and tell the speaker which home network to join.</li>
+        </ol>
+        <div id="hotspot-status" class="notice"></div>
+        <div id="hotspot-ui" hidden>
+          <button id="hotspot-find" class="secondary">Find speakers in setup mode</button>
+          <div id="hotspot-list" class="checks"></div>
+          <div id="hotspot-form" hidden>
+            <label>Home Wi-Fi name <input id="hotspot-ssid" placeholder="exact name, case-sensitive"></label>
+            <label>Password <input id="hotspot-password" type="password" autocomplete="off"></label>
+            <button id="hotspot-go">Connect speaker</button>
+          </div>
+        </div>
+        <h3>Other ways</h3>
+        <ul class="muted">
+          <li><b>WPS:</b> press your router's WPS button, then the speaker's WPS/Wi-Fi SETUP
+            button for about 1 second.</li>
+          <li><b>Ethernet:</b> plug the speaker into your router; it shows up under Speakers,
+            where <i>Change Wi-Fi</i> moves it onto Wi-Fi.</li>
+        </ul>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="dialog">
+    <form method="dialog" id="dialog-form">
+      <h2 id="dialog-title"></h2>
+      <div id="dialog-body"></div>
+      <div class="dialog-actions">
+        <button value="cancel" class="secondary" id="dialog-cancel">Cancel</button>
+        <button value="ok" id="dialog-ok">OK</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toast" hidden></div>
+  <script src="app.js"></script>
+</body>
+</html>

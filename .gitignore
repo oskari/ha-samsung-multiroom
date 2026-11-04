@@ -1,0 +1,20 @@
+# Secrets and per-device state
+.env
+soloist-data/
+soloist-data-linux/
+soloist-cache/
+librespot-cache/
+dev-data/
+samsung_wam_config.json
+
+# Third-party binaries (Soloist must not be redistributed; download it from Spotify)
+bin/
+
+# Early prototypes, superseded by the Home Assistant app in samsung_wam/
+wam_spotify_bridge.py
+docker/
+
+# Local tool settings
+.impeccable/
+__pycache__/
+dev-data-demo/

@@ -1,0 +1,18 @@
+configuration:
+  accept_spotify_terms:
+    name: Accept Spotify's terms for Soloist
+    description: >-
+      The Spotify Connect bridges use Spotify Soloist, which this app downloads
+      from Spotify. Turning this on means you accept Spotify's Terms and
+      Conditions of Use for it.
+  soloist_api_key:
+    name: Soloist API key
+    description: >-
+      Create your own at developer.spotify.com/dashboard/soloist (needs Spotify
+      Premium). Don't share it.
+  stream_port:
+    name: Stream port
+    description: Port the speakers fetch audio from. They must be able to reach this host on it.
+  advertise_ip:
+    name: Address the speakers use to reach this host
+    description: Leave empty to detect it automatically.

@@ -1,0 +1,5 @@
+# Deprecated by Supervisor and no longer needed: the Dockerfile names its
+# Debian base directly. Kept valid until it's deleted.
+build_from:
+  amd64: docker.io/library/debian:trixie-slim
+  aarch64: docker.io/library/debian:trixie-slim
