@@ -1,0 +1,265 @@
+# Lint the app, build its image for each architecture, and publish prebuilt
+# images to GitHub Container Registry, so Home Assistant can pull the app
+# instead of building samsung_wam/Dockerfile on every user's machine.
+#
+# - Pull request: lint, build and smoke-test both images. Nothing is published.
+# - Push to main: the same, then publish ghcr.io/<owner>/samsung-multiroom
+#   tagged with `version` from samsung_wam/config.yaml (and "latest"), unless
+#   that version is already published. Published tags are never overwritten:
+#   bump `version` to ship changes.
+# - Run workflow (Actions tab) with "publish" ticked: publish from the chosen
+#   branch, e.g. so the image exists before the version bump reaches main.
+#
+# The images are built with Home Assistant's own build actions, on native
+# amd64 and arm64 runners (no emulation). Spotify Soloist is never part of an
+# image: the app downloads it from Spotify at runtime, and the smoke test fails
+# the build if a Soloist binary ever ends up in one.
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "LICENSE"]
+  pull_request:
+    paths-ignore: ["**.md", "LICENSE"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the image for the current version, if it isn't published yet
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Never cancel a run on main: it may be halfway through publishing.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # The published multi-arch image is ghcr.io/<owner>/$IMAGE_NAME; the
+  # per-architecture images it is made of are ghcr.io/<owner>/<arch>-$IMAGE_NAME.
+  IMAGE_NAME: samsung-multiroom
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Lint the app configuration
+        uses: frenck/action-addon-linter@b9cfd1bc62ba60d2c4fc96317b5f7ada5923f4a7 # v2.21.1
+        with:
+          path: ./samsung_wam
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13" # the Python in the image (Debian trixie)
+
+      - name: Check Python
+        run: |
+          python -m compileall -q samsung_wam/rootfs/app dev ./*.py
+          python -m pip install --disable-pip-version-check --quiet ruff==0.17.3
+          # Syntax errors and pyflakes checks (undefined names, unused imports...)
+          ruff check --select E9,F --target-version py313 --output-format github .
+
+      - name: Check JavaScript
+        run: node --check samsung_wam/rootfs/app/static/app.js
+
+      - name: Check shell scripts
+        run: shellcheck samsung_wam/rootfs/run.sh .github/scripts/*.sh
+
+      - name: Check workflows
+        uses: docker://rhysd/actionlint:1.7.12
+        with:
+          args: -color
+
+      - name: Check that no binaries or archives are committed
+        run: |
+          # Spotify Soloist may not be redistributed; the app downloads it at runtime.
+          binaries=$(git ls-files -z | xargs -0 -r file --mime-type |
+            grep -E ': +application/(x-(executable|pie-executable|sharedlib|archive|tar|xz)|gzip|zip|zstd)$' || true)
+          soloist=$(git ls-files | grep -Ei '(^|/)soloist[^/]*$' | grep -v '\.py$' || true)
+          if [ -n "$binaries$soloist" ]; then
+            echo "::error::Binaries and archives don't belong in the repository (Spotify Soloist is downloaded at runtime):"
+            printf '%s\n' "$binaries" "$soloist"
+            exit 1
+          fi
+
+      - name: Check that CHANGELOG.md has an entry for the version
+        run: |
+          version=$(yq -r '.version' samsung_wam/config.yaml)
+          if ! awk -v v="$version" '$1 == "##" && $2 == v { found = 1 } END { exit !found }' samsung_wam/CHANGELOG.md; then
+            echo "::error file=samsung_wam/CHANGELOG.md::No '## $version' section for version $version in config.yaml"
+            exit 1
+          fi
+
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      architectures: ${{ steps.info.outputs.architectures }}
+      labels: ${{ steps.info.outputs.labels }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      publish: ${{ steps.info.outputs.publish }}
+      registry_prefix: ${{ steps.info.outputs.registry_prefix }}
+      version: ${{ steps.info.outputs.version }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read the app configuration
+        id: info
+        env:
+          EVENT: ${{ github.event_name }}
+          IS_FORK: ${{ github.event.repository.fork }}
+          OWNER: ${{ github.repository_owner }}
+          PUBLISH_INPUT: ${{ inputs.publish }}
+        run: |
+          cfg=samsung_wam/config.yaml
+          version=$(yq -r '.version' "$cfg")
+          name=$(yq -r '.name' "$cfg")
+          description=$(yq -r '.description' "$cfg")
+          url=$(yq -r '.url // ""' "$cfg")
+          image=$(yq -r '.image // ""' "$cfg")
+          registry_prefix="ghcr.io/${OWNER,,}"
+
+          # Supervisor pulls the tag named exactly like `version`.
+          if ! [[ "$version" =~ ^[0-9]+(\.[0-9]+)+([.-][0-9A-Za-z]+)*$ ]]; then
+            echo "::error file=$cfg::version '$version' is not a release version like 1.2.3"
+            exit 1
+          fi
+          # Once config.yaml has `image:`, it must be the image published here.
+          if [[ -n "$image" && "$image" != "$registry_prefix/$IMAGE_NAME" ]]; then
+            echo "::error file=$cfg::image is '$image', but this workflow publishes $registry_prefix/$IMAGE_NAME"
+            exit 1
+          fi
+
+          publish=false
+          if [[ "$IS_FORK" != "true" ]]; then
+            if [[ "$EVENT" == "push" && "$GITHUB_REF" == "refs/heads/main" ]] ||
+               [[ "$EVENT" == "workflow_dispatch" && "$PUBLISH_INPUT" == "true" ]]; then
+              publish=true
+            fi
+          fi
+          echo "Version $version, publish: $publish"
+
+          {
+            echo "version=$version"
+            echo "registry_prefix=$registry_prefix"
+            echo "architectures=$(yq -o=json -I=0 '.arch' "$cfg")"
+            echo "publish=$publish"
+            echo "labels<<LABELS_EOF"
+            echo "io.hass.type=app"
+            echo "io.hass.name=$name"
+            echo "io.hass.description=$description"
+            if [[ -n "$url" ]]; then echo "io.hass.url=$url"; fi
+            echo "org.opencontainers.image.title=$name"
+            echo "org.opencontainers.image.description=$description"
+            echo "org.opencontainers.image.licenses=MIT"
+            echo "LABELS_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Prepare the build matrix
+        id: matrix
+        uses: home-assistant/builder/actions/prepare-multi-arch-matrix@7412f0023ea9b6e58e8bb5059f1660f51376f49a # 2026.09.0
+        with:
+          architectures: ${{ steps.info.outputs.architectures }}
+          image-name: ${{ env.IMAGE_NAME }}
+          registry-prefix: ${{ steps.info.outputs.registry_prefix }}
+
+  build:
+    name: Build ${{ matrix.arch }}
+    needs: [lint, prepare]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write # sign the published image with cosign (keyless)
+      packages: write # push to GitHub Container Registry
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build the image
+        uses: home-assistant/builder/actions/build-image@7412f0023ea9b6e58e8bb5059f1660f51376f49a # 2026.09.0
+        with:
+          arch: ${{ matrix.arch }}
+          container-registry-password: ${{ secrets.GITHUB_TOKEN }}
+          context: ./samsung_wam
+          image: ${{ matrix.image }}
+          image-tags: ci
+          labels: ${{ needs.prepare.outputs.labels }}
+          load: true
+          version: ${{ needs.prepare.outputs.version }}
+
+      - name: Smoke-test the image
+        env:
+          IMAGE: ${{ matrix.image }}:ci
+        run: docker run --rm -i --entrypoint /bin/sh "$IMAGE" -s < .github/scripts/smoke-test.sh
+
+      # Same build again (from the cache) with the release tags, pushed and
+      # signed. Skipped, with a warning, if this version is already published.
+      - name: Publish the image
+        if: needs.prepare.outputs.publish == 'true'
+        uses: home-assistant/builder/actions/build-image@7412f0023ea9b6e58e8bb5059f1660f51376f49a # 2026.09.0
+        with:
+          arch: ${{ matrix.arch }}
+          container-registry-password: ${{ secrets.GITHUB_TOKEN }}
+          context: ./samsung_wam
+          image: ${{ matrix.image }}
+          image-tags: |
+            ${{ needs.prepare.outputs.version }}
+            latest
+          labels: ${{ needs.prepare.outputs.labels }}
+          push: true
+          skip-existing: ${{ needs.prepare.outputs.version }}
+          version: ${{ needs.prepare.outputs.version }}
+
+  manifest:
+    name: Publish the multi-arch image
+    needs: [prepare, build]
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      id-token: write # sign the manifest with cosign (keyless)
+      packages: write # push to GitHub Container Registry
+    steps:
+      - name: Publish the multi-arch manifest
+        uses: home-assistant/builder/actions/publish-multi-arch-manifest@7412f0023ea9b6e58e8bb5059f1660f51376f49a # 2026.09.0
+        with:
+          architectures: ${{ needs.prepare.outputs.architectures }}
+          container-registry-password: ${{ secrets.GITHUB_TOKEN }}
+          image-name: ${{ env.IMAGE_NAME }}
+          image-tags: |
+            ${{ needs.prepare.outputs.version }}
+            latest
+          registry-prefix: ${{ needs.prepare.outputs.registry_prefix }}
+          skip-existing: ${{ needs.prepare.outputs.version }}
+
+      - name: Check the published image
+        env:
+          ARCHITECTURES: ${{ needs.prepare.outputs.architectures }}
+          IMAGE: ${{ needs.prepare.outputs.registry_prefix }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.version }}
+        run: |
+          docker buildx imagetools inspect "$IMAGE"
+          # Home Assistant's aarch64 is Docker's arm64.
+          docker buildx imagetools inspect --raw "$IMAGE" | jq -e --argjson archs "$ARCHITECTURES" '
+            ($archs | map(if . == "aarch64" then "arm64" else . end) | sort) as $want
+            | [.manifests[].platform | select(.os == "linux") | .architecture] | sort == $want'

@@ -8,9 +8,6 @@ url: https://github.com/oskari/ha-samsung-multiroom
 arch:
   - amd64
   - aarch64
-startup: application
-boot: auto
-init: true
 # Host networking: speakers must reach the stream server, and Spotify finds the
 # bridges through local discovery (mDNS) on the home network.
 host_network: true
